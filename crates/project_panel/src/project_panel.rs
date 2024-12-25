@@ -3200,7 +3200,7 @@ impl ProjectPanel {
             item_colors.default
         };
 
-        let bg_hover_color = if self.mouse_down {
+        let bg_hover_color = if self.mouse_down || is_marked || is_active {
             item_colors.marked_active
         } else {
             item_colors.hover
@@ -3897,6 +3897,11 @@ impl Render for ProjectPanel {
                         this.hide_scrollbar(cx);
                     }
                 }))
+                .on_click(cx.listener(|this, _event, cx| {
+                    cx.stop_propagation();
+                    this.selection = None;
+                    this.marked_entries.clear();
+                }))
                 .key_context(self.dispatch_context(cx))
                 .on_action(cx.listener(Self::select_next))
                 .on_action(cx.listener(Self::select_prev))
@@ -4095,7 +4100,7 @@ impl Render for ProjectPanel {
                     deferred(
                         anchored()
                             .position(*position)
-                            .anchor(gpui::AnchorCorner::TopLeft)
+                            .anchor(gpui::Corner::TopLeft)
                             .child(menu.clone()),
                     )
                     .with_priority(1)
