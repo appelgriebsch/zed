@@ -177,7 +177,7 @@ impl LabelCommon for Label {
     }
 
     fn single_line(mut self) -> Self {
-        self.label = SharedString::from(self.label.replace('\n', "␤"));
+        self.label = SharedString::from(self.label.replace('\n', "⏎"));
         self.base = self.base.single_line();
         self
     }
@@ -199,7 +199,7 @@ mod label_preview {
 
     // View this component preview using `workspace: open component-preview`
     impl ComponentPreview for Label {
-        fn preview(_window: &mut Window, _cx: &App) -> AnyElement {
+        fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
             v_flex()
                 .gap_6()
                 .children(vec![
