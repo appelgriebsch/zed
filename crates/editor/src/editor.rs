@@ -123,7 +123,7 @@ pub use proposed_changes_editor::{
     ProposedChangeLocation, ProposedChangesEditor, ProposedChangesEditorToolbar,
 };
 use smallvec::smallvec;
-use std::iter::Peekable;
+use std::{cell::OnceCell, iter::Peekable};
 use task::{ResolvedTask, TaskTemplate, TaskVariables};
 
 pub use lsp::CompletionContext;
@@ -188,16 +188,12 @@ use ui::{
 use util::{maybe, post_inc, RangeExt, ResultExt, TryFutureExt};
 use workspace::{
     item::{ItemHandle, PreviewTabsSettings},
-    ItemId, RestoreOnStartupBehavior,
-};
-use workspace::{
     notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt},
-    WorkspaceSettings,
+    searchable::SearchEvent,
+    Item as WorkspaceItem, ItemId, ItemNavHistory, OpenInTerminal, OpenTerminal,
+    RestoreOnStartupBehavior, SplitDirection, TabBarSettings, Toast, ViewId, Workspace,
+    WorkspaceId, WorkspaceSettings, SERIALIZATION_THROTTLE_TIME,
 };
-use workspace::{
-    searchable::SearchEvent, ItemNavHistory, SplitDirection, ViewId, Workspace, WorkspaceId,
-};
-use workspace::{Item as WorkspaceItem, OpenInTerminal, OpenTerminal, TabBarSettings, Toast};
 
 use crate::hover_links::{find_url, find_url_from_range};
 use crate::signature_help::{SignatureHelpHiddenBy, SignatureHelpState};
@@ -641,7 +637,7 @@ pub struct Editor {
     selection_history: SelectionHistory,
     autoclose_regions: Vec<AutocloseRegion>,
     snippet_stack: InvalidationStack<SnippetState>,
-    select_larger_syntax_node_stack: Vec<Box<[Selection<usize>]>>,
+    select_syntax_node_history: SelectSyntaxNodeHistory,
     ime_transaction: Option<TransactionId>,
     active_diagnostics: Option<ActiveDiagnosticGroup>,
     show_inline_diagnostics: bool,
@@ -777,6 +773,7 @@ pub struct Editor {
     toggle_fold_multiple_buffers: Task<()>,
     _scroll_cursor_center_top_bottom_task: Task<()>,
     serialize_selections: Task<()>,
+    serialize_folds: Task<()>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -1031,6 +1028,42 @@ pub struct ClipboardSelection {
     pub first_line_indent: u32,
 }
 
+// selections, scroll behavior, was newest selection reversed
+type SelectSyntaxNodeHistoryState = (
+    Box<[Selection<usize>]>,
+    SelectSyntaxNodeScrollBehavior,
+    bool,
+);
+
+#[derive(Default)]
+struct SelectSyntaxNodeHistory {
+    stack: Vec<SelectSyntaxNodeHistoryState>,
+    // disable temporarily to allow changing selections without losing the stack
+    pub disable_clearing: bool,
+}
+
+impl SelectSyntaxNodeHistory {
+    pub fn try_clear(&mut self) {
+        if !self.disable_clearing {
+            self.stack.clear();
+        }
+    }
+
+    pub fn push(&mut self, selection: SelectSyntaxNodeHistoryState) {
+        self.stack.push(selection);
+    }
+
+    pub fn pop(&mut self) -> Option<SelectSyntaxNodeHistoryState> {
+        self.stack.pop()
+    }
+}
+
+enum SelectSyntaxNodeScrollBehavior {
+    CursorTop,
+    CenterSelection,
+    CursorBottom,
+}
+
 #[derive(Debug)]
 pub(crate) struct NavigationData {
     cursor_anchor: Anchor,
@@ -1183,6 +1216,7 @@ impl Editor {
                 display_map.set_state(&snapshot, cx);
             });
         });
+        clone.folds_did_change(cx);
         clone.selections.clone_state(&self.selections);
         clone.scroll_manager.clone_state(&self.scroll_manager);
         clone.searchable = self.searchable;
@@ -1372,7 +1406,7 @@ impl Editor {
             selection_history: Default::default(),
             autoclose_regions: Default::default(),
             snippet_stack: Default::default(),
-            select_larger_syntax_node_stack: Vec::new(),
+            select_syntax_node_history: SelectSyntaxNodeHistory::default(),
             ime_transaction: Default::default(),
             active_diagnostics: None,
             show_inline_diagnostics: ProjectSettings::get_global(cx).diagnostics.inline.enabled,
@@ -1514,6 +1548,7 @@ impl Editor {
             selection_mark_mode: false,
             toggle_fold_multiple_buffers: Task::ready(()),
             serialize_selections: Task::ready(()),
+            serialize_folds: Task::ready(()),
             text_style_refinement: None,
             load_diff_task: load_uncommitted_diff,
         };
@@ -2133,7 +2168,7 @@ impl Editor {
         self.add_selections_state = None;
         self.select_next_state = None;
         self.select_prev_state = None;
-        self.select_larger_syntax_node_stack.clear();
+        self.select_syntax_node_history.try_clear();
         self.invalidate_autoclose_regions(&self.selections.disjoint_anchors(), buffer);
         self.snippet_stack
             .invalidate(&self.selections.disjoint_anchors(), buffer);
@@ -2144,6 +2179,7 @@ impl Editor {
         self.push_to_nav_history(
             *old_cursor_position,
             Some(new_cursor_position.to_point(buffer)),
+            false,
             cx,
         );
 
@@ -2254,7 +2290,7 @@ impl Editor {
                 let snapshot = self.buffer().read(cx).snapshot(cx);
                 let selections = selections.clone();
                 self.serialize_selections = cx.background_spawn(async move {
-                    background_executor.timer(Duration::from_millis(100)).await;
+                    background_executor.timer(SERIALIZATION_THROTTLE_TIME).await;
                     let selections = selections
                         .iter()
                         .map(|selection| {
@@ -2273,6 +2309,40 @@ impl Editor {
         }
 
         cx.notify();
+    }
+
+    fn folds_did_change(&mut self, cx: &mut Context<Self>) {
+        if !self.is_singleton(cx)
+            || WorkspaceSettings::get(None, cx).restore_on_startup == RestoreOnStartupBehavior::None
+        {
+            return;
+        }
+
+        let Some(workspace_id) = self.workspace.as_ref().and_then(|workspace| workspace.1) else {
+            return;
+        };
+        let background_executor = cx.background_executor().clone();
+        let editor_id = cx.entity().entity_id().as_u64() as ItemId;
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        let folds = self.display_map.update(cx, |display_map, cx| {
+            display_map
+                .snapshot(cx)
+                .folds_in_range(0..snapshot.len())
+                .map(|fold| {
+                    (
+                        fold.range.start.to_offset(&snapshot),
+                        fold.range.end.to_offset(&snapshot),
+                    )
+                })
+                .collect()
+        });
+        self.serialize_folds = cx.background_spawn(async move {
+            background_executor.timer(SERIALIZATION_THROTTLE_TIME).await;
+            DB.save_editor_folds(editor_id, workspace_id, folds)
+                .await
+                .with_context(|| format!("persisting editor folds for editor {editor_id}, workspace {workspace_id:?}"))
+                .log_err();
+        });
     }
 
     pub fn sync_selections(
@@ -6019,7 +6089,9 @@ impl Editor {
                     .breakpoints(&buffer, None, buffer_snapshot.clone(), cx)
             {
                 let point = buffer_snapshot.summary_for_anchor::<Point>(&breakpoint.0);
-                let anchor = multi_buffer_snapshot.anchor_before(point);
+                let mut anchor = multi_buffer_snapshot.anchor_before(point);
+                anchor.text_anchor = breakpoint.0;
+
                 breakpoint_display_points.insert(
                     snapshot
                         .point_to_display_point(
@@ -9429,7 +9501,15 @@ impl Editor {
         self.do_paste(&text, metadata, false, window, cx);
     }
 
+    pub fn copy_and_trim(&mut self, _: &CopyAndTrim, _: &mut Window, cx: &mut Context<Self>) {
+        self.do_copy(true, cx);
+    }
+
     pub fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        self.do_copy(false, cx);
+    }
+
+    fn do_copy(&self, strip_leading_indents: bool, cx: &mut Context<Self>) {
         let selections = self.selections.all::<Point>(cx);
         let buffer = self.buffer.read(cx).read(cx);
         let mut text = String::new();
@@ -9438,7 +9518,7 @@ impl Editor {
         {
             let max_point = buffer.max_point();
             let mut is_first = true;
-            for selection in selections.iter() {
+            for selection in &selections {
                 let mut start = selection.start;
                 let mut end = selection.end;
                 let is_entire_line = selection.is_empty() || self.selections.line_mode;
@@ -9446,21 +9526,55 @@ impl Editor {
                     start = Point::new(start.row, 0);
                     end = cmp::min(max_point, Point::new(end.row + 1, 0));
                 }
-                if is_first {
-                    is_first = false;
+
+                let mut trimmed_selections = Vec::new();
+                if strip_leading_indents && end.row.saturating_sub(start.row) > 0 {
+                    let row = MultiBufferRow(start.row);
+                    let first_indent = buffer.indent_size_for_line(row);
+                    if first_indent.len == 0 || start.column > first_indent.len {
+                        trimmed_selections.push(start..end);
+                    } else {
+                        trimmed_selections.push(
+                            Point::new(row.0, first_indent.len)
+                                ..Point::new(row.0, buffer.line_len(row)),
+                        );
+                        for row in start.row + 1..=end.row {
+                            let row_indent_size = buffer.indent_size_for_line(MultiBufferRow(row));
+                            if row_indent_size.len >= first_indent.len {
+                                trimmed_selections.push(
+                                    Point::new(row, first_indent.len)
+                                        ..Point::new(row, buffer.line_len(MultiBufferRow(row))),
+                                );
+                            } else {
+                                trimmed_selections.clear();
+                                trimmed_selections.push(start..end);
+                                break;
+                            }
+                        }
+                    }
                 } else {
-                    text += "\n";
+                    trimmed_selections.push(start..end);
                 }
-                let mut len = 0;
-                for chunk in buffer.text_for_range(start..end) {
-                    text.push_str(chunk);
-                    len += chunk.len();
+
+                for trimmed_range in trimmed_selections {
+                    if is_first {
+                        is_first = false;
+                    } else {
+                        text += "\n";
+                    }
+                    let mut len = 0;
+                    for chunk in buffer.text_for_range(trimmed_range.start..trimmed_range.end) {
+                        text.push_str(chunk);
+                        len += chunk.len();
+                    }
+                    clipboard_selections.push(ClipboardSelection {
+                        len,
+                        is_entire_line,
+                        first_line_indent: buffer
+                            .indent_size_for_line(MultiBufferRow(trimmed_range.start.row))
+                            .len,
+                    });
                 }
-                clipboard_selections.push(ClipboardSelection {
-                    len,
-                    is_entire_line,
-                    first_line_indent: buffer.indent_size_for_line(MultiBufferRow(start.row)).len,
-                });
             }
         }
 
@@ -10728,10 +10842,15 @@ impl Editor {
         self.nav_history.as_ref()
     }
 
+    pub fn create_nav_history_entry(&mut self, cx: &mut Context<Self>) {
+        self.push_to_nav_history(self.selections.newest_anchor().head(), None, false, cx);
+    }
+
     fn push_to_nav_history(
         &mut self,
         cursor_anchor: Anchor,
         new_position: Option<Point>,
+        is_deactivate: bool,
         cx: &mut Context<Self>,
     ) {
         if let Some(nav_history) = self.nav_history.as_mut() {
@@ -10757,6 +10876,10 @@ impl Editor {
                 }),
                 cx,
             );
+            cx.emit(EditorEvent::PushedToNavHistory {
+                anchor: cursor_anchor,
+                is_deactivate,
+            })
         }
     }
 
@@ -11728,13 +11851,19 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(visible_row_count) = self.visible_row_count() else {
+            return;
+        };
+        let old_selections: Box<[_]> = self.selections.all::<usize>(cx).into();
+        if old_selections.is_empty() {
+            return;
+        }
+
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let buffer = self.buffer.read(cx).snapshot(cx);
-        let old_selections = self.selections.all::<usize>(cx).into_boxed_slice();
 
-        let mut stack = mem::take(&mut self.select_larger_syntax_node_stack);
         let mut selected_larger_node = false;
-        let new_selections = old_selections
+        let mut new_selections = old_selections
             .iter()
             .map(|selection| {
                 let old_range = selection.start..selection.end;
@@ -11776,13 +11905,56 @@ impl Editor {
             })
             .collect::<Vec<_>>();
 
-        if selected_larger_node {
-            stack.push(old_selections);
-            self.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
-                s.select(new_selections);
-            });
+        if !selected_larger_node {
+            return; // don't put this call in the history
         }
-        self.select_larger_syntax_node_stack = stack;
+
+        // scroll based on transformation done to the last selection created by the user
+        let (last_old, last_new) = old_selections
+            .last()
+            .zip(new_selections.last().cloned())
+            .expect("old_selections isn't empty");
+
+        // revert selection
+        let is_selection_reversed = {
+            let should_newest_selection_be_reversed = last_old.start != last_new.start;
+            new_selections.last_mut().expect("checked above").reversed =
+                should_newest_selection_be_reversed;
+            should_newest_selection_be_reversed
+        };
+
+        if selected_larger_node {
+            self.select_syntax_node_history.disable_clearing = true;
+            self.change_selections(None, window, cx, |s| {
+                s.select(new_selections.clone());
+            });
+            self.select_syntax_node_history.disable_clearing = false;
+        }
+
+        let start_row = last_new.start.to_display_point(&display_map).row().0;
+        let end_row = last_new.end.to_display_point(&display_map).row().0;
+        let selection_height = end_row - start_row + 1;
+        let scroll_margin_rows = self.vertical_scroll_margin() as u32;
+
+        // if fits on screen (considering margin), keep it in the middle, else, scroll to selection head
+        let scroll_behavior = if visible_row_count >= selection_height + scroll_margin_rows * 2 {
+            let middle_row = (end_row + start_row) / 2;
+            let selection_center = middle_row.saturating_sub(visible_row_count / 2);
+            self.set_scroll_top_row(DisplayRow(selection_center), window, cx);
+            SelectSyntaxNodeScrollBehavior::CenterSelection
+        } else if is_selection_reversed {
+            self.scroll_cursor_top(&Default::default(), window, cx);
+            SelectSyntaxNodeScrollBehavior::CursorTop
+        } else {
+            self.scroll_cursor_bottom(&Default::default(), window, cx);
+            SelectSyntaxNodeScrollBehavior::CursorBottom
+        };
+
+        self.select_syntax_node_history.push((
+            old_selections,
+            scroll_behavior,
+            is_selection_reversed,
+        ));
     }
 
     pub fn select_smaller_syntax_node(
@@ -11791,13 +11963,44 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut stack = mem::take(&mut self.select_larger_syntax_node_stack);
-        if let Some(selections) = stack.pop() {
-            self.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
+        let Some(visible_row_count) = self.visible_row_count() else {
+            return;
+        };
+
+        if let Some((mut selections, scroll_behavior, is_selection_reversed)) =
+            self.select_syntax_node_history.pop()
+        {
+            let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+
+            if let Some(selection) = selections.last_mut() {
+                selection.reversed = is_selection_reversed;
+            }
+
+            self.select_syntax_node_history.disable_clearing = true;
+            self.change_selections(None, window, cx, |s| {
                 s.select(selections.to_vec());
             });
+            self.select_syntax_node_history.disable_clearing = false;
+
+            let newest = self.selections.newest::<usize>(cx);
+            let start_row = newest.start.to_display_point(&display_map).row().0;
+            let end_row = newest.end.to_display_point(&display_map).row().0;
+
+            match scroll_behavior {
+                SelectSyntaxNodeScrollBehavior::CursorTop => {
+                    self.scroll_cursor_top(&Default::default(), window, cx);
+                }
+                SelectSyntaxNodeScrollBehavior::CenterSelection => {
+                    let middle_row = (end_row + start_row) / 2;
+                    let selection_center = middle_row.saturating_sub(visible_row_count / 2);
+                    // centralize the selection, not the cursor
+                    self.set_scroll_top_row(DisplayRow(selection_center), window, cx);
+                }
+                SelectSyntaxNodeScrollBehavior::CursorBottom => {
+                    self.scroll_cursor_bottom(&Default::default(), window, cx);
+                }
+            }
         }
-        self.select_larger_syntax_node_stack = stack;
     }
 
     fn refresh_runnables(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
@@ -14314,6 +14517,7 @@ impl Editor {
         }
 
         self.scrollbar_marker_state.dirty = true;
+        self.folds_did_change(cx);
     }
 
     /// Removes any folds whose ranges intersect any of the given ranges.
@@ -14327,6 +14531,7 @@ impl Editor {
         self.remove_folds_with(ranges, auto_scroll, cx, |map, cx| {
             map.unfold_intersecting(ranges.iter().cloned(), inclusive, cx)
         });
+        self.folds_did_change(cx);
     }
 
     pub fn fold_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
@@ -14378,6 +14583,7 @@ impl Editor {
         self.remove_folds_with(ranges, auto_scroll, cx, |map, cx| {
             map.remove_folds_with_type(ranges.iter().cloned(), type_id, cx)
         });
+        self.folds_did_change(cx);
     }
 
     fn remove_folds_with<T: ToOffset + Clone>(
@@ -17100,31 +17306,52 @@ impl Editor {
         self.load_diff_task.clone()
     }
 
-    fn read_selections_from_db(
+    fn read_metadata_from_db(
         &mut self,
         item_id: u64,
         workspace_id: WorkspaceId,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if !self.is_singleton(cx)
-            || WorkspaceSettings::get(None, cx).restore_on_startup == RestoreOnStartupBehavior::None
+        if self.is_singleton(cx)
+            && WorkspaceSettings::get(None, cx).restore_on_startup != RestoreOnStartupBehavior::None
         {
-            return;
-        }
-        let Some(selections) = DB.get_editor_selections(item_id, workspace_id).log_err() else {
-            return;
-        };
-        if selections.is_empty() {
-            return;
+            let buffer_snapshot = OnceCell::new();
+
+            if let Some(selections) = DB.get_editor_selections(item_id, workspace_id).log_err() {
+                if !selections.is_empty() {
+                    let snapshot =
+                        buffer_snapshot.get_or_init(|| self.buffer.read(cx).snapshot(cx));
+                    self.change_selections(None, window, cx, |s| {
+                        s.select_ranges(selections.into_iter().map(|(start, end)| {
+                            snapshot.clip_offset(start, Bias::Left)
+                                ..snapshot.clip_offset(end, Bias::Right)
+                        }));
+                    });
+                }
+            };
+
+            if let Some(folds) = DB.get_editor_folds(item_id, workspace_id).log_err() {
+                if !folds.is_empty() {
+                    let snapshot =
+                        buffer_snapshot.get_or_init(|| self.buffer.read(cx).snapshot(cx));
+                    self.fold_ranges(
+                        folds
+                            .into_iter()
+                            .map(|(start, end)| {
+                                snapshot.clip_offset(start, Bias::Left)
+                                    ..snapshot.clip_offset(end, Bias::Right)
+                            })
+                            .collect(),
+                        false,
+                        window,
+                        cx,
+                    );
+                }
+            }
         }
 
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        self.change_selections(None, window, cx, |s| {
-            s.select_ranges(selections.into_iter().map(|(start, end)| {
-                snapshot.clip_offset(start, Bias::Left)..snapshot.clip_offset(end, Bias::Right)
-            }));
-        });
+        self.read_scroll_position_from_db(item_id, workspace_id, window, cx);
     }
 }
 
@@ -18512,6 +18739,10 @@ pub enum EditorEvent {
     },
     Reloaded,
     CursorShapeChanged,
+    PushedToNavHistory {
+        anchor: Anchor,
+        is_deactivate: bool,
+    },
 }
 
 impl EventEmitter<EditorEvent> for Editor {}

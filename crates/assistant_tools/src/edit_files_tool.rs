@@ -24,10 +24,7 @@ use util::ResultExt;
 pub struct EditFilesToolInput {
     /// High-level edit instructions. These will be interpreted by a smaller
     /// model, so explain the changes you want that model to make and which
-    /// file paths need changing.
-    ///
-    /// The description should be concise and clear. We will show this
-    /// description to the user as well.
+    /// file paths need changing. The description should be concise and clear.
     ///
     /// WARNING: When specifying which file paths need changing, you MUST
     /// start each path with one of the project's root directories.
@@ -58,6 +55,21 @@ pub struct EditFilesToolInput {
     /// Notice how we never specify code snippets in the instructions!
     /// </example>
     pub edit_instructions: String,
+
+    /// A user-friendly description of what changes are being made.
+    /// This will be shown to the user in the UI to describe the edit operation. The screen real estate for this UI will be extremely
+    /// constrained, so make the description extremely terse.
+    ///
+    /// <example>
+    /// For fixing a broken authentication system:
+    /// "Fix auth bug in login flow"
+    /// </example>
+    ///
+    /// <example>
+    /// For adding unit tests to a module:
+    /// "Add tests for user profile logic"
+    /// </example>
+    pub display_description: String,
 }
 
 pub struct EditFilesTool;
@@ -67,6 +79,10 @@ impl Tool for EditFilesTool {
         "edit-files".into()
     }
 
+    fn needs_confirmation(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> String {
         include_str!("./edit_files_tool/description.md").into()
     }
@@ -74,6 +90,13 @@ impl Tool for EditFilesTool {
     fn input_schema(&self) -> serde_json::Value {
         let schema = schemars::schema_for!(EditFilesToolInput);
         serde_json::to_value(&schema).unwrap()
+    }
+
+    fn ui_text(&self, input: &serde_json::Value) -> String {
+        match serde_json::from_value::<EditFilesToolInput>(input.clone()) {
+            Ok(input) => input.display_description,
+            Err(_) => "Edit files".to_string(),
+        }
     }
 
     fn run(
@@ -141,9 +164,16 @@ enum DiffResult {
 }
 
 #[derive(Debug)]
-struct BadSearch {
-    file_path: String,
-    search: String,
+enum BadSearch {
+    NoMatch {
+        file_path: String,
+        search: String,
+    },
+    EmptyBuffer {
+        file_path: String,
+        search: String,
+        exists: bool,
+    },
 }
 
 impl EditToolRequest {
@@ -290,6 +320,18 @@ impl EditToolRequest {
         file_path: std::path::PathBuf,
         snapshot: language::BufferSnapshot,
     ) -> Result<DiffResult> {
+        if snapshot.is_empty() {
+            let exists = snapshot
+                .file()
+                .map_or(false, |file| file.disk_state().exists());
+
+            return Ok(DiffResult::BadSearch(BadSearch::EmptyBuffer {
+                file_path: file_path.display().to_string(),
+                exists,
+                search: old,
+            }));
+        }
+
         let result =
             // Try to match exactly
             replace_exact(&old, &new, &snapshot)
@@ -298,7 +340,7 @@ impl EditToolRequest {
             .or_else(|| replace_with_flexible_indent(&old, &new, &snapshot));
 
         let Some(diff) = result else {
-            return anyhow::Ok(DiffResult::BadSearch(BadSearch {
+            return anyhow::Ok(DiffResult::BadSearch(BadSearch::NoMatch {
                 search: old,
                 file_path: file_path.display().to_string(),
             }));
@@ -358,12 +400,38 @@ impl EditToolRequest {
                     self.bad_searches.len()
                 )?;
 
-                for replace in self.bad_searches {
-                    writeln!(
-                        &mut output,
-                        "## No exact match in: {}\n```\n{}\n```\n",
-                        replace.file_path, replace.search,
-                    )?;
+                for bad_search in self.bad_searches {
+                    match bad_search {
+                        BadSearch::NoMatch { file_path, search } => {
+                            writeln!(
+                                &mut output,
+                                "## No exact match in: `{}`\n```\n{}\n```\n",
+                                file_path, search,
+                            )?;
+                        }
+                        BadSearch::EmptyBuffer {
+                            file_path,
+                            exists: true,
+                            search,
+                        } => {
+                            writeln!(
+                                &mut output,
+                                "## No match because `{}` is empty:\n```\n{}\n```\n",
+                                file_path, search,
+                            )?;
+                        }
+                        BadSearch::EmptyBuffer {
+                            file_path,
+                            exists: false,
+                            search,
+                        } => {
+                            writeln!(
+                                &mut output,
+                                "## No match because `{}` does not exist:\n```\n{}\n```\n",
+                                file_path, search,
+                            )?;
+                        }
+                    }
                 }
 
                 write!(&mut output,
